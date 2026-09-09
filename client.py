@@ -8,6 +8,7 @@ import time
 import tkinter as tk
 from tkinter import filedialog, messagebox, scrolledtext, ttk
 from typing import Optional
+from cryptography.fernet import Fernet
 
 try:
     import RNS
@@ -45,8 +46,14 @@ FONT_MONO   = ("Courier New", 10)
 FONT_SMALL  = ("Courier New", 9)
 FONT_LABEL  = ("Courier New", 10, "bold")
 
-IDENTITY_FILE  = "client_identity"
-SETTINGS_FILE  = "client_settings.json"
+DATA_DIR = os.path.expanduser("~/.cipromail")
+if not os.path.exists(DATA_DIR):
+    os.makedirs(DATA_DIR)
+
+SETTINGS_FILE = os.path.join(DATA_DIR, "client_settings.json")
+SETTINGS_FILE_ENC = os.path.join(DATA_DIR, "client_settings.dat")
+IDENTITY_FILE = os.path.join(DATA_DIR, "identity")
+KEY_FILE = os.path.join(DATA_DIR, "cipro.key")
 
 
 class RNSWorker(threading.Thread):
@@ -193,10 +200,7 @@ class RNSWorker(threading.Thread):
             self._emit("error", f"Error de envío: {exc}")
 
     def _send_callback(self, resource):
-        if msg.get("msg_type") == "server_error":
-            self._emit("server_error", msg)
-        else:
-            self._emit("status", "✓ Recurso entregado al gateway.")
+        self._emit("status", "✓ Recurso entregado al gateway.")
 
     def run(self):
         if not self._init_rns():
@@ -746,13 +750,35 @@ class CiproMailApp(tk.Tk):
                 f.write(att_raw)
             messagebox.showinfo("Guardado", f"Adjunto guardado en:\n{save_path}")
 
+    def _get_cipher(self):
+        if os.path.exists(KEY_FILE):
+            with open(KEY_FILE, "rb") as f:
+                key = f.read()
+        else:
+            key = Fernet.generate_key()
+            with open(KEY_FILE, "wb") as f:
+                f.write(key)
+        return Fernet(key)
+
     def _load_settings(self) -> dict:
+        if os.path.exists(SETTINGS_FILE_ENC):
+            try:
+                cipher = self._get_cipher()
+                with open(SETTINGS_FILE_ENC, "rb") as f:
+                    enc_data = f.read()
+                data = cipher.decrypt(enc_data)
+                return json.loads(data.decode("utf-8"))
+            except Exception as e:
+                print(f"Error loading encrypted settings: {e}")
+
         if os.path.exists(SETTINGS_FILE):
             try:
                 with open(SETTINGS_FILE, "r") as f:
-                    return json.load(f)
+                    settings = json.load(f)
+                return settings
             except Exception:
                 pass
+
         return {"gateway_hash": "", "from_addr": ""}
 
     def _apply_settings(self):
@@ -800,8 +826,18 @@ class CiproMailApp(tk.Tk):
             "pass": self._imap_pass_var.get(),
         }
         
-        with open(SETTINGS_FILE, "w") as f:
-            json.dump(self._settings, f, indent=2)
+        try:
+            cipher = self._get_cipher()
+            json_str = json.dumps(self._settings)
+            enc_data = cipher.encrypt(json_str.encode("utf-8"))
+            with open(SETTINGS_FILE_ENC, "wb") as f:
+                f.write(enc_data)
+                
+            if os.path.exists(SETTINGS_FILE):
+                os.remove(SETTINGS_FILE)
+        except Exception as e:
+            messagebox.showerror("Error al guardar", f"No se pudo cifrar la configuración: {e}")
+            return
 
         if gw:
             self.rns_worker.set_gateway_hash(gw)
