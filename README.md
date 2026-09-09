@@ -14,6 +14,18 @@ El sistema consta de dos componentes independientes:
 
 ---
 
+## 🆘 Comunicación de Emergencias
+
+Este proyecto está pensado para que **cualquier persona ante una situación de desastre o emergencia** pueda mantener su capacidad de comunicación intacta. 
+
+Si te encuentras en una zona afectada y dispones de acceso a una red basada en Reticulum (como la red de **[www.cipropanama.org](https://www.cipropanama.org)**), solo necesitas ejecutar el cliente de CIPRO Micro-Mail. Si en esa red existe un equipo operando como servidor Gateway de *SMTP-Reticulum* con salida a Internet, **podrás enviar y recibir correos utilizando tu propia cuenta de correo tradicional**.
+
+**Privacidad y Seguridad Garantizadas:**
+- **Credenciales Seguras:** Tus configuraciones y contraseñas de correo nunca se guardan en texto plano; se almacenan en el disco duro de tu computadora de forma local y **estrictamente encriptada**.
+- **Transmisión Cifrada y Transparente:** Por la red Reticulum toda tu información viaja protegida de extremo a extremo de forma nativa. El servidor Gateway opera como un "Proxy Abierto Ciego": procesa tus contraseñas en su memoria temporal solo durante la fracción de segundo que dura el envío, despacha tu correo, y descarta tus credenciales inmediatamente. El operador de la red nunca tiene acceso a tu cuenta ni se queda con tus datos.
+
+---
+
 ## Arquitectura
 
 ```

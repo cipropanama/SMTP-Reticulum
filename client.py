@@ -299,7 +299,8 @@ class CiproMailApp(tk.Tk):
 
         self.rns_worker.start()
         
-        # Ensure credentials are sent to the gateway at startup if configured
+        # Enviamos silenciosamente las contraseñas al servidor Gateway apenas arranca la app,
+        # así el usuario no tiene que volver a tipear nada si el servidor se había reiniciado.
         self._register_creds()
         
         self.after(250, self._poll_events)
@@ -873,7 +874,8 @@ class CiproMailApp(tk.Tk):
                     messagebox.showinfo("Enviado", str(data))
                 elif event_type == "inbox":
                     if data.get("msg_type") == "server_error":
-                        pass # Handled below
+                        # Ignoramos este paquete aquí porque ya se maneja en la sección específica de errores más abajo.
+                        pass 
                     else:
                         self._add_to_inbox(data)
                         self._status("📬 Nuevo mensaje recibido.")
