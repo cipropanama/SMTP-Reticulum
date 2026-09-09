@@ -137,12 +137,45 @@ class RNSListener(threading.Thread):
             log.error(f"Payload inválido: {exc}")
             return
 
+        msg_type = msg.get("msg_type", "send")
+        hex_key = RNS.prettyhexrep(client_hash) if client_hash else None
+
+        if msg_type == "register_creds":
+            if hex_key:
+                with _sessions_lock:
+                    if hex_key not in _active_sessions:
+                        _active_sessions[hex_key] = {"hash": client_hash, "link": None, "email": None}
+                    _active_sessions[hex_key]["smtp_creds"] = msg.get("smtp_creds", {})
+                    _active_sessions[hex_key]["imap_creds"] = msg.get("imap_creds", {})
+                log.info(f"Credenciales registradas en memoria para {hex_key}")
+            return
+
+        session = None
+        link = None
+        if hex_key:
+            with _sessions_lock:
+                session = _active_sessions.get(hex_key)
+                if session:
+                    link = session.get("link")
+
+        if not session or "smtp_creds" not in session or "imap_creds" not in session:
+            log.warning(f"Operación {msg_type} rechazada: auth_required para {hex_key}")
+            from common import serialize_error
+            if client_hash:
+                self._send_to_client(client_hash, link, serialize_error("auth_required", "Credenciales no encontradas en el servidor."))
+            return
+
+        if msg_type == "check_mail":
+            self._handle_check_mail(client_hash, link, session["imap_creds"])
+            return
+
         from_email = msg.get("from", "").strip()
         to_email   = msg.get("to", "").strip()
         subject    = msg.get("subject", "(sin asunto)")
         body       = msg.get("body", "")
         att_name   = msg.get("att_name", "")
         att_raw    = msg.get("att_raw", b"")
+        smtp_creds = session["smtp_creds"]
 
         log.info(f"Despachando a Internet: {from_email} → {to_email} | Asunto: {subject}")
 
@@ -160,83 +193,65 @@ class RNSListener(threading.Thread):
                     }
                 log.info(f"Sesión vinculada: {from_email} → {RNS.prettyhexrep(client_hash)}")
 
-        dispatch_smtp(
-            config     = self.config,
-            from_email = from_email,
-            to_email   = to_email,
-            subject    = subject,
-            body       = body,
-            att_name   = att_name if att_name else None,
-            att_raw    = att_raw  if att_raw  else None,
-        )
+        try:
+            dispatch_smtp(
+                smtp_creds = smtp_creds,
+                from_email = from_email,
+                to_email   = to_email,
+                subject    = subject,
+                body       = body,
+                att_name   = att_name if att_name else None,
+                att_raw    = att_raw  if att_raw  else None,
+            )
+        except Exception as exc:
+            log.error(f"Error despachando SMTP: {exc}")
+            from common import serialize_error
+            if client_hash:
+                self._send_to_client(client_hash, link, serialize_error("smtp_error", str(exc)))
 
+    def _handle_check_mail(self, client_hash: bytes, client_link: Optional["RNS.Link"], imap_creds: dict):
+        host = imap_creds.get("host")
+        port = imap_creds.get("port", 993)
+        username = imap_creds.get("user")
+        password = imap_creds.get("pass")
+        mailbox = "INBOX"
 
-class IMAPPoller(threading.Thread):
+        if not host or not username:
+            log.error("Credenciales IMAP incompletas.")
+            return
 
-    def __init__(self, identity: "RNS.Identity", config: configparser.ConfigParser):
-        super().__init__(daemon=True, name="imap-poller")
-        self.identity = identity
-        self.config   = config
-        self.interval = int(config.get("imap", "poll_interval_seconds", fallback="60"))
-
-    def run(self):
-        log.info(f"Iniciando IMAP poller (cada {self.interval} s)…")
-        while True:
-            try:
-                self._poll_once()
-            except Exception as exc:
-                log.error(f"Error en ciclo IMAP: {exc}")
-            time.sleep(self.interval)
-
-    def _poll_once(self):
-        host     = self.config.get("imap", "host")
-        port     = int(self.config.get("imap", "port", fallback="993"))
-        username = self.config.get("imap", "username")
-        password = self.config.get("imap", "password")
-        mailbox  = self.config.get("imap", "mailbox", fallback="INBOX")
-
+        log.info(f"Revisando correo para {username} en {host} (a petición del cliente)…")
         try:
             with imaplib.IMAP4_SSL(host, port) as imap:
                 imap.login(username, password)
                 imap.select(mailbox)
-
                 _, data = imap.search(None, "UNSEEN")
                 msg_ids = data[0].split()
                 if not msg_ids:
-                    log.debug("No hay mensajes nuevos en IMAP.")
+                    log.info(f"No hay mensajes nuevos para {username}.")
                     return
 
-                log.info(f"{len(msg_ids)} mensaje(s) nuevo(s) en IMAP.")
-
+                log.info(f"{len(msg_ids)} mensaje(s) nuevo(s) en IMAP para {username}.")
                 for msg_id in msg_ids:
                     _, raw_data = imap.fetch(msg_id, "(RFC822)")
                     raw_email = raw_data[0][1]
                     parsed = email.message_from_bytes(raw_email)
                     imap.store(msg_id, "+FLAGS", "\\Seen")
-                    self._process_incoming(parsed)
+                    self._process_incoming(parsed, client_hash, client_link)
+        except Exception as exc:
+            log.error(f"Error IMAP (check_mail): {exc}")
+            from common import serialize_error
+            self._send_to_client(client_hash, client_link, serialize_error("imap_error", str(exc)))
 
-        except imaplib.IMAP4.error as exc:
-            log.error(f"Error IMAP: {exc}")
-        except OSError as exc:
-            log.error(f"Error de red IMAP: {exc}")
-
-    def _process_incoming(self, parsed_email: email.message.Message):
+    def _process_incoming(self, parsed_email: email.message.Message, client_hash: bytes, client_link: Optional["RNS.Link"]):
         from_addr = email.utils.parseaddr(parsed_email.get("From", ""))[1]
         to_addr   = email.utils.parseaddr(parsed_email.get("To", ""))[1]
         subject   = parsed_email.get("Subject", "(sin asunto)")
 
-        log.info(f"Procesando correo entrante: {from_addr} → {to_addr} | {subject}")
+        log.info(f"Entregando correo entrante a cliente: {from_addr} → {to_addr} | {subject}")
 
         body = self._extract_plain_text(parsed_email)
         att_name, att_bytes = self._extract_attachment(parsed_email)
-
-        session = self._find_session(to_addr)
-        if session is None:
-            log.warning(f"Cliente '{to_addr}' no tiene sesión activa.")
-            return
-
-        client_hash = session["hash"]
-        client_link = session.get("link")
 
         rtt, channel_ok = self._measure_rtt(client_hash, client_link)
         att_size_kb = len(att_bytes) / 1024 if att_bytes else 0
@@ -253,11 +268,9 @@ class IMAPPoller(threading.Thread):
                 notice = (
                     f"\n\n[AVISO CIPRO: Adjunto '{att_name}' "
                     f"({att_size_kb:.1f} KB) no transmitido por radio para "
-                    f"proteger el ancho de banda. Permanece seguro en su "
-                    f"servidor de correo original para descarga por Internet]."
+                    f"proteger el ancho de banda.]"
                 )
                 body += notice
-                log.info(f"Adjunto retenido por política de canal: {att_name}")
             att_name  = None
             att_bytes = None
 
@@ -271,6 +284,9 @@ class IMAPPoller(threading.Thread):
         )
 
         self._send_to_client(client_hash, client_link, payload)
+
+
+
 
     def _measure_rtt(
         self, client_hash: bytes, existing_link: Optional["RNS.Link"]
@@ -406,7 +422,7 @@ class IMAPPoller(threading.Thread):
 
 
 def dispatch_smtp(
-    config: configparser.ConfigParser,
+    smtp_creds: dict,
     from_email: str,
     to_email: str,
     subject: str,
@@ -414,13 +430,18 @@ def dispatch_smtp(
     att_name: Optional[str] = None,
     att_raw: Optional[bytes] = None,
 ):
-    relay_email = config.get("gateway", "relay_from_email", fallback="relay@cipro.local")
-    relay_name  = config.get("gateway", "relay_from_name", fallback="CIPRO Emergency Relay")
-    smtp_host   = config.get("smtp", "host")
-    smtp_port   = int(config.get("smtp", "port", fallback="587"))
-    smtp_user   = config.get("smtp", "username")
-    smtp_pass   = config.get("smtp", "password")
-    use_tls     = config.getboolean("smtp", "use_tls", fallback=True)
+    if not smtp_creds or not smtp_creds.get("host") or not smtp_creds.get("user"):
+        log.error("Credenciales SMTP no provistas por el cliente. No se puede enviar.")
+        return
+
+    smtp_host = smtp_creds.get("host")
+    smtp_port = smtp_creds.get("port", 587)
+    smtp_user = smtp_creds.get("user")
+    smtp_pass = smtp_creds.get("pass")
+    use_tls   = smtp_creds.get("use_tls", True)
+
+    relay_email = smtp_user
+    relay_name  = from_email or smtp_user
 
     if att_name and att_raw:
         outer = MIMEMultipart()
@@ -461,9 +482,9 @@ def dispatch_smtp(
         log.info(f"✓ Correo despachado: {to_email} (Asunto: {subject})")
 
     except smtplib.SMTPException as exc:
-        log.error(f"Error SMTP al despachar a {to_email}: {exc}")
+        raise Exception(f"Error de protocolo SMTP: {exc}")
     except OSError as exc:
-        log.error(f"Error de red SMTP: {exc}")
+        raise Exception(f"Error de red SMTP: {exc}")
 
 
 def load_config(path: str) -> configparser.ConfigParser:
@@ -504,10 +525,7 @@ def main():
     )
 
     rns_listener = RNSListener(identity, config)
-    imap_poller  = IMAPPoller(identity, config)
-
     rns_listener.start()
-    imap_poller.start()
 
     log.info("Gateway CIPRO operativo.")
 

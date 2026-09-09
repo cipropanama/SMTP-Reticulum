@@ -59,6 +59,7 @@ def serialize_message(
     att_bytes: Optional[bytes] = None,
 ) -> bytes:
     payload: dict = {
+        "msg_type":       "send",
         "to":             to.strip(),
         "from":           from_addr.strip(),
         "subject":        subject.strip(),
@@ -70,25 +71,57 @@ def serialize_message(
     return json.dumps(payload, ensure_ascii=False).encode("utf-8")
 
 
+def serialize_check_mail() -> bytes:
+    payload: dict = {
+        "msg_type": "check_mail",
+    }
+    return json.dumps(payload, ensure_ascii=False).encode("utf-8")
+
+
+def serialize_error(error_code: str, error_msg: str) -> bytes:
+    payload = {
+        "msg_type": "server_error",
+        "error_code": error_code,
+        "error_msg": error_msg,
+    }
+    return json.dumps(payload, ensure_ascii=False).encode("utf-8")
+
+
+def serialize_register_creds(smtp_creds: dict, imap_creds: dict) -> bytes:
+    payload = {
+        "msg_type": "register_creds",
+        "smtp_creds": smtp_creds,
+        "imap_creds": imap_creds,
+    }
+    return json.dumps(payload, ensure_ascii=False).encode("utf-8")
+
+
 def deserialize_message(data: bytes) -> dict:
     try:
         msg = json.loads(data.decode("utf-8"))
     except (json.JSONDecodeError, UnicodeDecodeError) as exc:
         raise ValueError(f"Payload RNS inválido: {exc}") from exc
 
-    required = ("to", "subject", "body", "has_attachment")
-    for field in required:
-        if field not in msg:
-            raise ValueError(f"Campo obligatorio ausente en payload: '{field}'")
+    msg_type = msg.get("msg_type", "send")
+    msg["msg_type"] = msg_type
 
-    if msg.get("has_attachment") and msg.get("att_b64"):
-        try:
-            msg["att_raw"] = base64.b64decode(msg["att_b64"])
-        except Exception as exc:
-            raise ValueError(f"Error decodificando adjunto base64: {exc}") from exc
-    else:
-        msg["att_raw"] = b""
+    if msg_type == "send":
+        required = ("to", "subject", "body", "has_attachment")
+        for field in required:
+            if field not in msg:
+                raise ValueError(f"Campo obligatorio ausente en payload: '{field}'")
 
+        if msg.get("has_attachment") and msg.get("att_b64"):
+            try:
+                msg["att_raw"] = base64.b64decode(msg["att_b64"])
+            except Exception as exc:
+                raise ValueError(f"Error decodificando adjunto base64: {exc}") from exc
+        else:
+            msg["att_raw"] = b""
+    elif msg_type == "register_creds":
+        if "smtp_creds" not in msg or "imap_creds" not in msg:
+            raise ValueError("Faltan credenciales en register_creds")
+        
     return msg
 
 

@@ -119,6 +119,12 @@ class RNSWorker(threading.Thread):
     def send_message(self, payload: dict):
         self.cmd_queue.put(("send", payload))
 
+    def send_check_mail(self):
+        self.cmd_queue.put(("check_mail", None))
+
+    def send_register_creds(self, smtp_creds: dict, imap_creds: dict):
+        self.cmd_queue.put(("register_creds", {"smtp": smtp_creds, "imap": imap_creds}))
+
     def set_gateway_hash(self, hex_str: str):
         self.cmd_queue.put(("set_gateway", hex_str))
 
@@ -187,7 +193,9 @@ class RNSWorker(threading.Thread):
             self._emit("error", f"Error de envío: {exc}")
 
     def _send_callback(self, resource):
-        if resource.status == RNS.Resource.COMPLETE:
+        if msg.get("msg_type") == "server_error":
+            self._emit("server_error", msg)
+        else:
             self._emit("status", "✓ Recurso entregado al gateway.")
 
     def run(self):
@@ -199,6 +207,10 @@ class RNSWorker(threading.Thread):
                 cmd, data = self.cmd_queue.get(timeout=0.5)
                 if cmd == "send":
                     self._do_send(data)
+                elif cmd == "check_mail":
+                    self._do_check_mail()
+                elif cmd == "register_creds":
+                    self._do_register_creds(data["smtp"], data["imap"])
                 elif cmd == "set_gateway":
                     try:
                         self._gateway_hash = bytes.fromhex(data.strip())
@@ -213,6 +225,49 @@ class RNSWorker(threading.Thread):
     def stop(self):
         self._stop_event.set()
         self.cmd_queue.put(("stop", None))
+
+    def _do_check_mail(self):
+        if self._gateway_hash is None:
+            self._emit("error", "Hash del gateway no configurado.")
+            return
+
+        from common import serialize_check_mail
+        try:
+            gw_identity = RNS.Identity.recall(self._gateway_hash)
+            if not gw_identity:
+                self._emit("error", "Gateway no alcanzable.")
+                return
+
+            gw_dest = RNS.Destination(
+                gw_identity, RNS.Destination.OUT, RNS.Destination.SINGLE, APP_NAME, ASPECT
+            )
+
+            data = serialize_check_mail()
+            self._emit("status", "Consultando servidor IMAP…")
+            pkt = RNS.Packet(gw_dest, data)
+            pkt.send()
+        except Exception as exc:
+            self._emit("error", f"Error al consultar correo: {exc}")
+
+    def _do_register_creds(self, smtp_creds: dict, imap_creds: dict):
+        if self._gateway_hash is None:
+            return
+            
+        from common import serialize_register_creds
+        try:
+            gw_identity = RNS.Identity.recall(self._gateway_hash)
+            if not gw_identity:
+                return
+
+            gw_dest = RNS.Destination(
+                gw_identity, RNS.Destination.OUT, RNS.Destination.SINGLE, APP_NAME, ASPECT
+            )
+            data = serialize_register_creds(smtp_creds, imap_creds)
+            pkt = RNS.Packet(gw_dest, data)
+            pkt.send()
+            self._emit("status", "Credenciales sincronizadas con el servidor.")
+        except Exception as exc:
+            self._emit("error", f"Error al enviar credenciales: {exc}")
 
     def _emit(self, event_type: str, data):
         self.event_queue.put((event_type, data))
@@ -239,6 +294,10 @@ class CiproMailApp(tk.Tk):
         self._apply_settings()
 
         self.rns_worker.start()
+        
+        # Ensure credentials are sent to the gateway at startup if configured
+        self._register_creds()
+        
         self.after(250, self._poll_events)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
@@ -379,8 +438,14 @@ class CiproMailApp(tk.Tk):
         self._tree.pack(fill="x", padx=8, pady=(8, 0))
         self._tree.bind("<<TreeviewSelect>>", self._on_message_select)
 
+        self._sync_btn = tk.Button(
+            f, text="🔄 Sincronizar Correo", command=self._sync_mail,
+            bg=C_HIGHLIGHT, fg=C_TEXT, font=FONT_SMALL, relief="flat", cursor="hand2"
+        )
+        self._sync_btn.pack(anchor="e", padx=8, pady=(4, 0))
+
         tk.Label(f, text="Mensaje:", bg=C_SURFACE, fg=C_MUTED, font=FONT_LABEL, anchor="w").pack(
-            fill="x", padx=8, pady=(8, 0)
+            fill="x", padx=8, pady=(4, 0)
         )
         self._read_text = scrolledtext.ScrolledText(
             f, height=12, bg=C_ENTRY_BG, fg=C_TEXT, font=FONT_MONO,
@@ -397,48 +462,95 @@ class CiproMailApp(tk.Tk):
 
     def _build_settings_tab(self):
         f = self._tab_settings
-        pad = {"padx": 16, "pady": 6}
-
-        tk.Label(
-            f, text="CONFIGURACIÓN RNS", bg=C_SURFACE, fg=C_HIGHLIGHT,
-            font=("Courier New", 11, "bold"), anchor="w",
-        ).pack(fill="x", padx=16, pady=(16, 4))
-
-        tk.Label(f, text="Destination Hash del Gateway (32 hex chars):",
-                  bg=C_SURFACE, fg=C_MUTED, font=FONT_LABEL, anchor="w").pack(fill="x", **pad)
-
-        self._gw_hash_var = tk.StringVar()
-        gw_entry = tk.Entry(f, textvariable=self._gw_hash_var, bg=C_ENTRY_BG, fg=C_TEXT,
-                             insertbackground=C_TEXT, font=FONT_MONO, relief="flat", bd=4)
-        gw_entry.pack(fill="x", padx=16, pady=(0, 4))
-
-        tk.Label(f, text="Tu dirección de correo (From):",
-                  bg=C_SURFACE, fg=C_MUTED, font=FONT_LABEL, anchor="w").pack(fill="x", **pad)
-
-        self._from_var = tk.StringVar()
-        tk.Entry(f, textvariable=self._from_var, bg=C_ENTRY_BG, fg=C_TEXT,
-                  insertbackground=C_TEXT, font=FONT_MONO, relief="flat", bd=4).pack(
-            fill="x", padx=16, pady=(0, 12)
+        
+        canvas = tk.Canvas(f, bg=C_SURFACE, highlightthickness=0)
+        scrollbar = ttk.Scrollbar(f, orient="vertical", command=canvas.yview)
+        scrollable_frame = tk.Frame(canvas, bg=C_SURFACE)
+        
+        scrollable_frame.bind(
+            "<Configure>",
+            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
         )
+        canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+        
+        canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+        
+        pad = {"padx": 16, "pady": 2}
+        sf = scrollable_frame
+
+        tk.Label(sf, text="CONFIGURACIÓN RNS", bg=C_SURFACE, fg=C_HIGHLIGHT, font=FONT_LABEL, anchor="w").pack(fill="x", pady=(16, 4), padx=16)
+        tk.Label(sf, text="Destination Hash Gateway:", bg=C_SURFACE, fg=C_MUTED, font=FONT_SMALL, anchor="w").pack(fill="x", **pad)
+        self._gw_hash_var = tk.StringVar()
+        tk.Entry(sf, textvariable=self._gw_hash_var, bg=C_ENTRY_BG, fg=C_TEXT, font=FONT_MONO).pack(fill="x", padx=16, pady=(0, 4))
+        
+        tk.Label(sf, text="Tu Correo (From):", bg=C_SURFACE, fg=C_MUTED, font=FONT_SMALL, anchor="w").pack(fill="x", **pad)
+        self._from_var = tk.StringVar()
+        tk.Entry(sf, textvariable=self._from_var, bg=C_ENTRY_BG, fg=C_TEXT, font=FONT_MONO).pack(fill="x", padx=16, pady=(0, 10))
+
+        tk.Label(sf, text="CREDENCIALES SMTP (Envío)", bg=C_SURFACE, fg=C_HIGHLIGHT, font=FONT_LABEL, anchor="w").pack(fill="x", pady=(10, 4), padx=16)
+        
+        self._smtp_host_var = tk.StringVar()
+        self._smtp_port_var = tk.StringVar(value="587")
+        self._smtp_user_var = tk.StringVar()
+        self._smtp_pass_var = tk.StringVar()
+        self._smtp_tls_var  = tk.BooleanVar(value=True)
+        
+        row1 = tk.Frame(sf, bg=C_SURFACE)
+        row1.pack(fill="x", **pad)
+        tk.Label(row1, text="Host:", bg=C_SURFACE, fg=C_MUTED, font=FONT_SMALL, width=6, anchor="w").pack(side="left")
+        tk.Entry(row1, textvariable=self._smtp_host_var, bg=C_ENTRY_BG, fg=C_TEXT, font=FONT_MONO).pack(side="left", fill="x", expand=True, padx=(0, 4))
+        tk.Label(row1, text="Port:", bg=C_SURFACE, fg=C_MUTED, font=FONT_SMALL, width=5).pack(side="left")
+        tk.Entry(row1, textvariable=self._smtp_port_var, bg=C_ENTRY_BG, fg=C_TEXT, font=FONT_MONO, width=5).pack(side="left")
+
+        row2 = tk.Frame(sf, bg=C_SURFACE)
+        row2.pack(fill="x", **pad)
+        tk.Label(row2, text="User:", bg=C_SURFACE, fg=C_MUTED, font=FONT_SMALL, width=6, anchor="w").pack(side="left")
+        tk.Entry(row2, textvariable=self._smtp_user_var, bg=C_ENTRY_BG, fg=C_TEXT, font=FONT_MONO).pack(side="left", fill="x", expand=True)
+
+        row3 = tk.Frame(sf, bg=C_SURFACE)
+        row3.pack(fill="x", **pad)
+        tk.Label(row3, text="Pass:", bg=C_SURFACE, fg=C_MUTED, font=FONT_SMALL, width=6, anchor="w").pack(side="left")
+        tk.Entry(row3, textvariable=self._smtp_pass_var, show="*", bg=C_ENTRY_BG, fg=C_TEXT, font=FONT_MONO).pack(side="left", fill="x", expand=True, padx=(0, 4))
+        tk.Checkbutton(row3, text="TLS", variable=self._smtp_tls_var, bg=C_SURFACE, fg=C_MUTED, selectcolor=C_ENTRY_BG, activebackground=C_SURFACE, activeforeground=C_TEXT).pack(side="left")
+
+        tk.Label(sf, text="CREDENCIALES IMAP (Recepción)", bg=C_SURFACE, fg=C_HIGHLIGHT, font=FONT_LABEL, anchor="w").pack(fill="x", pady=(10, 4), padx=16)
+
+        self._imap_host_var = tk.StringVar()
+        self._imap_port_var = tk.StringVar(value="993")
+        self._imap_user_var = tk.StringVar()
+        self._imap_pass_var = tk.StringVar()
+
+        row4 = tk.Frame(sf, bg=C_SURFACE)
+        row4.pack(fill="x", **pad)
+        tk.Label(row4, text="Host:", bg=C_SURFACE, fg=C_MUTED, font=FONT_SMALL, width=6, anchor="w").pack(side="left")
+        tk.Entry(row4, textvariable=self._imap_host_var, bg=C_ENTRY_BG, fg=C_TEXT, font=FONT_MONO).pack(side="left", fill="x", expand=True, padx=(0, 4))
+        tk.Label(row4, text="Port:", bg=C_SURFACE, fg=C_MUTED, font=FONT_SMALL, width=5).pack(side="left")
+        tk.Entry(row4, textvariable=self._imap_port_var, bg=C_ENTRY_BG, fg=C_TEXT, font=FONT_MONO, width=5).pack(side="left")
+
+        row5 = tk.Frame(sf, bg=C_SURFACE)
+        row5.pack(fill="x", **pad)
+        tk.Label(row5, text="User:", bg=C_SURFACE, fg=C_MUTED, font=FONT_SMALL, width=6, anchor="w").pack(side="left")
+        tk.Entry(row5, textvariable=self._imap_user_var, bg=C_ENTRY_BG, fg=C_TEXT, font=FONT_MONO).pack(side="left", fill="x", expand=True)
+
+        row6 = tk.Frame(sf, bg=C_SURFACE)
+        row6.pack(fill="x", **pad)
+        tk.Label(row6, text="Pass:", bg=C_SURFACE, fg=C_MUTED, font=FONT_SMALL, width=6, anchor="w").pack(side="left")
+        tk.Entry(row6, textvariable=self._imap_pass_var, show="*", bg=C_ENTRY_BG, fg=C_TEXT, font=FONT_MONO).pack(side="left", fill="x", expand=True)
 
         tk.Button(
-            f, text="💾 Guardar Ajustes", command=self._save_settings,
-            bg=C_HIGHLIGHT, fg=C_TEXT, font=FONT_LABEL,
-            relief="flat", cursor="hand2", pady=8,
-        ).pack(fill="x", padx=16, pady=(0, 8))
+            sf, text="💾 Guardar Ajustes", command=self._save_settings,
+            bg=C_HIGHLIGHT, fg=C_TEXT, font=FONT_LABEL, relief="flat", cursor="hand2", pady=4
+        ).pack(fill="x", padx=16, pady=(12, 8))
 
-        self._id_lbl = tk.Label(
-            f, text="Identidad RNS: (iniciando…)",
-            bg=C_SURFACE, fg=C_MUTED, font=FONT_SMALL,
-            wraplength=480, justify="left",
-        )
+        self._id_lbl = tk.Label(sf, text="Identidad RNS: (iniciando…)", bg=C_SURFACE, fg=C_MUTED, font=FONT_SMALL, wraplength=480, justify="left")
         self._id_lbl.pack(fill="x", padx=16, pady=4)
 
         tk.Button(
-            f, text="♻ Regenerar Identidad (¡Perderás tu hash!)", command=self._regen_identity,
-            bg=C_ACCENT, fg=C_RED, font=FONT_SMALL,
-            relief="flat", cursor="hand2", pady=6,
-        ).pack(fill="x", padx=16, pady=(4, 0))
+            sf, text="♻ Regenerar Identidad", command=self._regen_identity,
+            bg=C_ACCENT, fg=C_RED, font=FONT_SMALL, relief="flat", cursor="hand2", pady=4
+        ).pack(fill="x", padx=16, pady=(4, 16))
 
     def _attach_file(self):
         path = filedialog.askopenfilename(
@@ -546,6 +658,40 @@ class CiproMailApp(tk.Tk):
         self.rns_worker.send_message(payload)
         self._status("📡 Enviando mensaje…")
 
+    def _sync_mail(self):
+        gw_hash = self._gw_hash_var.get().strip()
+        if not validate_destination_hash(gw_hash):
+            messagebox.showwarning("Gateway inválido", "Configura el Hash del Gateway en Ajustes.")
+            return
+
+        self.rns_worker.set_gateway_hash(gw_hash)
+        self.rns_worker.send_check_mail()
+        self._status("🔄 Sincronizando con el servidor…")
+
+    def _register_creds(self):
+        gw_hash = self._gw_hash_var.get().strip()
+        if not validate_destination_hash(gw_hash):
+            return
+            
+        smtp_creds = {
+            "host": self._smtp_host_var.get().strip(),
+            "port": int(self._smtp_port_var.get().strip() or "587"),
+            "user": self._smtp_user_var.get().strip(),
+            "pass": self._smtp_pass_var.get().strip(),
+            "use_tls": self._smtp_tls_var.get(),
+        }
+        
+        imap_creds = {
+            "host": self._imap_host_var.get().strip(),
+            "port": int(self._imap_port_var.get().strip() or "993"),
+            "user": self._imap_user_var.get().strip(),
+            "pass": self._imap_pass_var.get().strip(),
+        }
+        
+        if smtp_creds["host"] and imap_creds["host"]:
+            self.rns_worker.set_gateway_hash(gw_hash)
+            self.rns_worker.send_register_creds(smtp_creds, imap_creds)
+
     def _add_to_inbox(self, msg: dict):
         self._inbox.append(msg)
         idx = len(self._inbox) - 1
@@ -612,6 +758,20 @@ class CiproMailApp(tk.Tk):
     def _apply_settings(self):
         self._gw_hash_var.set(self._settings.get("gateway_hash", ""))
         self._from_var.set(self._settings.get("from_addr", ""))
+        
+        smtp = self._settings.get("smtp", {})
+        self._smtp_host_var.set(smtp.get("host", ""))
+        self._smtp_port_var.set(smtp.get("port", "587"))
+        self._smtp_user_var.set(smtp.get("user", ""))
+        self._smtp_pass_var.set(smtp.get("pass", ""))
+        self._smtp_tls_var.set(smtp.get("use_tls", True))
+        
+        imap = self._settings.get("imap", {})
+        self._imap_host_var.set(imap.get("host", ""))
+        self._imap_port_var.set(imap.get("port", "993"))
+        self._imap_user_var.set(imap.get("user", ""))
+        self._imap_pass_var.set(imap.get("pass", ""))
+
         gw = self._settings.get("gateway_hash", "").strip()
         if validate_destination_hash(gw):
             self.rns_worker.set_gateway_hash(gw)
@@ -621,19 +781,31 @@ class CiproMailApp(tk.Tk):
         addr = self._from_var.get().strip()
 
         if gw and not validate_destination_hash(gw):
-            messagebox.showwarning(
-                "Hash inválido",
-                "El Destination Hash debe tener exactamente 32 caracteres hexadecimales.",
-            )
+            messagebox.showwarning("Hash inválido", "El Hash debe tener 32 caracteres hexadecimales.")
             return
 
         self._settings["gateway_hash"] = gw
         self._settings["from_addr"]    = addr
+        self._settings["smtp"] = {
+            "host": self._smtp_host_var.get(),
+            "port": self._smtp_port_var.get(),
+            "user": self._smtp_user_var.get(),
+            "pass": self._smtp_pass_var.get(),
+            "use_tls": self._smtp_tls_var.get(),
+        }
+        self._settings["imap"] = {
+            "host": self._imap_host_var.get(),
+            "port": self._imap_port_var.get(),
+            "user": self._imap_user_var.get(),
+            "pass": self._imap_pass_var.get(),
+        }
+        
         with open(SETTINGS_FILE, "w") as f:
             json.dump(self._settings, f, indent=2)
 
         if gw:
             self.rns_worker.set_gateway_hash(gw)
+            self._register_creds()
         messagebox.showinfo("Ajustes guardados", "Configuración guardada correctamente.")
 
     def _regen_identity(self):
@@ -664,9 +836,26 @@ class CiproMailApp(tk.Tk):
                     self._status(f"✓ {data}")
                     messagebox.showinfo("Enviado", str(data))
                 elif event_type == "inbox":
-                    self._add_to_inbox(data)
-                    self._status("📬 Nuevo mensaje recibido.")
-                    messagebox.showinfo("Nuevo mensaje", f"De: {data.get('from','—')}\nAsunto: {data.get('subject','—')}")
+                    if data.get("msg_type") == "server_error":
+                        pass # Handled below
+                    else:
+                        self._add_to_inbox(data)
+                        self._status("📬 Nuevo mensaje recibido.")
+                        messagebox.showinfo("Nuevo mensaje", f"De: {data.get('from','—')}\nAsunto: {data.get('subject','—')}")
+                elif event_type == "server_error":
+                    code = data.get("error_code")
+                    msg = data.get("error_msg")
+                    if code == "auth_required":
+                        self._status("⚠ Re-enviando credenciales al servidor…", error=True)
+                        self._register_creds()
+                        messagebox.showinfo(
+                            "Reconexión de Sesión",
+                            "El servidor había perdido tus credenciales (quizás se reinició).\n"
+                            "Las he enviado automáticamente. Por favor, vuelve a presionar el botón de Enviar o Sincronizar."
+                        )
+                    else:
+                        self._status(f"⚠ Error Remoto: {code}", error=True)
+                        messagebox.showerror(f"Error en Servidor ({code})", msg)
         except queue.Empty:
             pass
         self.after(250, self._poll_events)
