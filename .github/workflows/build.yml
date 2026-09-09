@@ -15,22 +15,23 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Instalar dependencias del sistema (tkinter)
+      - name: Instalar tkinter (Linux)
         run: sudo apt-get install -y python3-tk
 
       - name: Instalar dependencias Python
         run: pip install -r requirements.txt pyinstaller
 
-      - name: Compilar cliente
+      - name: Compilar cliente Linux
         run: |
           pyinstaller --onefile --noconsole \
             --name cipro_client-linux \
             --add-data "common.py:." \
             --hidden-import=RNS \
             --hidden-import=PIL \
+            --hidden-import=PIL.Image \
             client.py
 
-      - name: Compilar gateway
+      - name: Compilar gateway Linux
         run: |
           pyinstaller --onefile \
             --name cipro_gateway-linux \
@@ -58,16 +59,17 @@ jobs:
       - name: Instalar dependencias Python
         run: pip install -r requirements.txt pyinstaller
 
-      - name: Compilar cliente
+      - name: Compilar cliente Windows
         run: |
           pyinstaller --onefile --noconsole `
             --name cipro_client-windows `
             --add-data "common.py;." `
             --hidden-import=RNS `
             --hidden-import=PIL `
+            --hidden-import=PIL.Image `
             client.py
 
-      - name: Compilar gateway
+      - name: Compilar gateway Windows
         run: |
           pyinstaller --onefile --noconsole `
             --name cipro_gateway-windows `
@@ -87,26 +89,28 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Configurar Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
+      - name: Instalar Python con tkinter via Homebrew
+        run: |
+          brew install python-tk@3.11
+          echo "PYTHON_BIN=$(brew --prefix python-tk@3.11)/bin/python3.11" >> $GITHUB_ENV
 
       - name: Instalar dependencias Python
-        run: pip install -r requirements.txt pyinstaller
-
-      - name: Compilar cliente
         run: |
-          pyinstaller --onefile --noconsole \
+          $(brew --prefix python-tk@3.11)/bin/python3.11 -m pip install -r requirements.txt pyinstaller
+
+      - name: Compilar cliente macOS
+        run: |
+          $(brew --prefix python-tk@3.11)/bin/python3.11 -m PyInstaller --onefile --noconsole \
             --name cipro_client-macos \
             --add-data "common.py:." \
             --hidden-import=RNS \
             --hidden-import=PIL \
+            --hidden-import=PIL.Image \
             client.py
 
-      - name: Compilar gateway
+      - name: Compilar gateway macOS
         run: |
-          pyinstaller --onefile \
+          $(brew --prefix python-tk@3.11)/bin/python3.11 -m PyInstaller --onefile \
             --name cipro_gateway-macos \
             --add-data "common.py:." \
             --hidden-import=RNS \
