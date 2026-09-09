@@ -1,0 +1,120 @@
+name: Build Executables
+
+on:
+  release:
+    types: [published]
+
+jobs:
+  build-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configurar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Instalar dependencias del sistema (tkinter)
+        run: sudo apt-get install -y python3-tk
+
+      - name: Instalar dependencias Python
+        run: pip install -r requirements.txt pyinstaller
+
+      - name: Compilar cliente
+        run: |
+          pyinstaller --onefile --noconsole \
+            --name cipro_client-linux \
+            --add-data "common.py:." \
+            --hidden-import=RNS \
+            --hidden-import=PIL \
+            client.py
+
+      - name: Compilar gateway
+        run: |
+          pyinstaller --onefile \
+            --name cipro_gateway-linux \
+            --add-data "common.py:." \
+            --hidden-import=RNS \
+            server.py
+
+      - name: Subir binarios al Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/cipro_client-linux
+            dist/cipro_gateway-linux
+
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configurar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Instalar dependencias Python
+        run: pip install -r requirements.txt pyinstaller
+
+      - name: Compilar cliente
+        run: |
+          pyinstaller --onefile --noconsole `
+            --name cipro_client-windows `
+            --add-data "common.py;." `
+            --hidden-import=RNS `
+            --hidden-import=PIL `
+            client.py
+
+      - name: Compilar gateway
+        run: |
+          pyinstaller --onefile --noconsole `
+            --name cipro_gateway-windows `
+            --add-data "common.py;." `
+            --hidden-import=RNS `
+            server.py
+
+      - name: Subir binarios al Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/cipro_client-windows.exe
+            dist/cipro_gateway-windows.exe
+
+  build-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configurar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Instalar dependencias Python
+        run: pip install -r requirements.txt pyinstaller
+
+      - name: Compilar cliente
+        run: |
+          pyinstaller --onefile --noconsole \
+            --name cipro_client-macos \
+            --add-data "common.py:." \
+            --hidden-import=RNS \
+            --hidden-import=PIL \
+            client.py
+
+      - name: Compilar gateway
+        run: |
+          pyinstaller --onefile \
+            --name cipro_gateway-macos \
+            --add-data "common.py:." \
+            --hidden-import=RNS \
+            server.py
+
+      - name: Subir binarios al Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/cipro_client-macos
+            dist/cipro_gateway-macos
