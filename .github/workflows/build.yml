@@ -92,18 +92,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Instalar Python con tkinter via Homebrew
-        run: |
-          brew install python-tk@3.11
-          echo "PYTHON_BIN=$(brew --prefix python-tk@3.11)/bin/python3.11" >> $GITHUB_ENV
+      - name: Configurar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
 
       - name: Instalar dependencias Python
-        run: |
-          $(brew --prefix python-tk@3.11)/bin/python3.11 -m pip install -r requirements.txt pyinstaller
+        run: pip install -r requirements.txt pyinstaller
 
       - name: Compilar cliente macOS
         run: |
-          $(brew --prefix python-tk@3.11)/bin/python3.11 -m PyInstaller --onefile --noconsole \
+          pyinstaller --onefile --noconsole \
             --name cipro_client-macos \
             --add-data "common.py:." \
             --hidden-import=RNS \
@@ -113,7 +112,7 @@ jobs:
 
       - name: Compilar gateway macOS
         run: |
-          $(brew --prefix python-tk@3.11)/bin/python3.11 -m PyInstaller --onefile \
+          pyinstaller --onefile \
             --name cipro_gateway-macos \
             --add-data "common.py:." \
             --hidden-import=RNS \
