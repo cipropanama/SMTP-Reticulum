@@ -1,0 +1,83 @@
+# config.ini.example — CIPRO Reticulum Mail Gateway
+# =========================================================
+# Copia este archivo como 'config.ini' y edita los valores.
+# NUNCA subas config.ini a un repositorio público — contiene
+# credenciales SMTP/IMAP en texto plano.
+# =========================================================
+
+[gateway]
+# Dirección de correo que aparece como remitente en los correos
+# que el gateway despacha hacia Internet en nombre de los clientes radio.
+relay_from_email = relay@tudominio.org
+
+# Nombre amigable del remitente relay
+relay_from_name = CIPRO Emergency Relay
+
+# =========================================================
+[smtp]
+# Servidor SMTP para enviar correos a Internet.
+# Compatible con Gmail, Outlook, Fastmail, Postfix propio, etc.
+host     = smtp.tudominio.org
+port     = 587
+
+# Credenciales SMTP
+username = relay@tudominio.org
+password = TU_PASSWORD_SMTP_AQUI
+
+# use_tls = true  → STARTTLS en el puerto especificado (587 por defecto)
+# use_tls = false → SMTP sobre SSL directo (normalmente puerto 465)
+use_tls = true
+
+# =========================================================
+[imap]
+# Servidor IMAP para recibir correos entrantes desde Internet.
+# El gateway hará polling periódico a esta cuenta y reenviará
+# los mensajes a los clientes radio correspondientes.
+host     = imap.tudominio.org
+port     = 993
+
+# Credenciales IMAP (pueden ser las mismas que SMTP)
+username = relay@tudominio.org
+password = TU_PASSWORD_IMAP_AQUI
+
+# Buzón a monitorear
+mailbox = INBOX
+
+# Intervalo de polling en segundos
+# Mínimo recomendado: 30 s | Estándar táctico: 60 s | Zona crítica: 15 s
+poll_interval_seconds = 60
+
+# =========================================================
+[limits]
+# Tope de peso de adjuntos para transmisión por radio (en KB)
+# Si el adjunto supera este valor, NO se transmite y se agrega una nota.
+max_attachment_kb = 40
+
+# Objetivo de compresión para imágenes (en KB)
+max_image_target_kb = 30
+
+# Umbral de RTT del canal Reticulum en segundos.
+# Si el RTT supera este valor, el canal se considera congestionado
+# y se retiene el adjunto aunque pese menos de max_attachment_kb.
+rtt_threshold_seconds = 3.5
+
+# Umbrales del semáforo de peso (solo para el cliente GUI)
+optimal_kb  = 2
+moderate_kb = 30
+
+# =========================================================
+# [client_map]
+# ─────────────────────────────────────────────────────────
+# SECCIÓN RESERVADA PARA USO FUTURO
+# En la versión actual, el mapeo correo → hash RNS es dinámico:
+# el cliente anuncia su hash al conectarse al gateway y la sesión
+# se mantiene activa mientras el link esté vivo.
+#
+# En una futura versión se podrá preconfigura un mapeo estático
+# para clientes que no estén conectados en el momento de recibir
+# el correo, permitiendo una cola de reintentos persistente.
+#
+# Formato (cuando se implemente):
+# usuario@ejemplo.com = aabbccddeeff00112233445566778899
+# otro@ejemplo.com    = 00112233445566778899aabbccddeeff
+# [client_map]
