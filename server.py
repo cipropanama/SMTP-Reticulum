@@ -11,6 +11,8 @@ import smtplib
 import sys
 import threading
 import time
+import json
+import base64
 from email.message import EmailMessage
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -34,12 +36,28 @@ from common import (
     serialize_message,
 )
 
+DATA_DIR = os.path.expanduser("~/.cipro_mail")
+if not os.path.exists(DATA_DIR):
+    os.makedirs(DATA_DIR)
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s — %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler(os.path.expanduser("~/.cipro_mail/server.log"))
+    ]
 )
-log = logging.getLogger("cipro.gateway")
+log = logging.getLogger("CIPRO-Server")
+
+def handle_exception(exc_type, exc_value, exc_traceback):
+    if issubclass(exc_type, KeyboardInterrupt):
+        sys.__excepthook__(exc_type, exc_value, exc_traceback)
+        return
+    log.critical("Uncaught exception", exc_info=(exc_type, exc_value, exc_traceback))
+
+sys.excepthook = handle_exception
 
 IDENTITY_FILE = "gateway_identity"
 DEFAULT_CONFIG = "config.ini"
@@ -68,12 +86,12 @@ class RNSListener(threading.Thread):
         self.dest.set_packet_callback(self._on_packet)
         self.dest.set_link_established_callback(self._on_link_established)
 
-        self.dest.announce()
+        self.dest.announce(app_data=b"CIPRO-HQ-Panama")
         log.info(f"Gateway escuchando en: {RNS.prettyhexrep(self.dest.hash)}")
 
         while True:
             time.sleep(5)
-            self.dest.announce()
+            self.dest.announce(app_data=b"CIPRO-HQ-Panama")
 
     def _on_packet(self, message: bytes, packet):
         log.info(f"Packet recibido ({len(message)} bytes)")
@@ -185,6 +203,18 @@ class RNSListener(threading.Thread):
             self._handle_check_mail(client_hash, link, session["imap_creds"])
             return
 
+        if msg_type == "fetch_msg":
+            uid = msg.get("uid")
+            if uid:
+                self._handle_fetch_msg(client_hash, link, session["imap_creds"], uid)
+            return
+
+        if msg_type == "delete_msg":
+            uid = msg.get("uid")
+            if uid:
+                self._handle_delete_msg(client_hash, link, session["imap_creds"], uid)
+            return
+
         from_email = msg.get("from", "").strip()
         to_email   = msg.get("to", "").strip()
         subject    = msg.get("subject", "(sin asunto)")
@@ -237,21 +267,120 @@ class RNSListener(threading.Thread):
             with imaplib.IMAP4_SSL(host, port) as imap:
                 imap.login(username, password)
                 imap.select(mailbox)
-                _, data = imap.search(None, "UNSEEN")
+                _, data = imap.search(None, "ALL")
                 msg_ids = data[0].split()
                 if not msg_ids:
-                    log.info(f"No hay mensajes nuevos para {username}.")
+                    log.info(f"No hay mensajes para {username}.")
+                    from common import serialize_success
+                    self._send_to_client(client_hash, client_link, serialize_success("Bandeja vacía."))
                     return
 
-                log.info(f"{len(msg_ids)} mensaje(s) nuevo(s) en IMAP para {username}.")
-                for msg_id in msg_ids:
-                    _, raw_data = imap.fetch(msg_id, "(RFC822)")
+                # Get only the last 30 messages to avoid huge payloads
+                msg_ids = msg_ids[-30:]
+                log.info(f"Obteniendo {len(msg_ids)} cabeceras en IMAP para {username}.")
+                
+                headers_list = []
+                for msg_id in reversed(msg_ids):  # newest first
+                    _, raw_data = imap.fetch(msg_id, "(BODY.PEEK[HEADER.FIELDS (FROM TO SUBJECT DATE MESSAGE-ID)])")
                     raw_email = raw_data[0][1]
                     parsed = email.message_from_bytes(raw_email)
-                    imap.store(msg_id, "+FLAGS", "\\Seen")
-                    self._process_incoming(parsed, client_hash, client_link)
+                    
+                    from_addr = email.utils.parseaddr(parsed.get("From", ""))[1]
+                    to_addr   = email.utils.parseaddr(parsed.get("To", ""))[1]
+                    subject   = parsed.get("Subject", "(sin asunto)")
+                    date_hdr  = parsed.get("Date", "")
+                    
+                    headers_list.append({
+                        "uid": msg_id.decode('utf-8'),
+                        "from": from_addr,
+                        "to": to_addr,
+                        "subject": subject,
+                        "date": date_hdr
+                    })
+                    
+                payload = json.dumps({"msg_type": "sync_list", "headers": headers_list}).encode('utf-8')
+                self._send_to_client(client_hash, client_link, payload)
         except Exception as exc:
             log.error(f"Error IMAP (check_mail): {exc}")
+            from common import serialize_error
+            self._send_to_client(client_hash, client_link, serialize_error("imap_error", str(exc)))
+
+    def _handle_fetch_msg(self, client_hash: bytes, client_link: Optional["RNS.Link"], imap_creds: dict, uid: str):
+        host = imap_creds.get("host")
+        port = imap_creds.get("port", 993)
+        username = imap_creds.get("user")
+        password = imap_creds.get("pass")
+        mailbox = "INBOX"
+
+        log.info(f"Descargando cuerpo del mensaje UID {uid} para {username}…")
+        try:
+            with imaplib.IMAP4_SSL(host, port) as imap:
+                imap.login(username, password)
+                imap.select(mailbox)
+                
+                _, raw_data = imap.fetch(uid.encode('utf-8'), "(RFC822)")
+                if not raw_data or not raw_data[0]:
+                    log.error(f"Mensaje {uid} no encontrado.")
+                    from common import serialize_error
+                    self._send_to_client(client_hash, client_link, serialize_error("imap_error", "Mensaje no encontrado."))
+                    return
+                    
+                raw_email = raw_data[0][1]
+                parsed = email.message_from_bytes(raw_email)
+                
+                # Mark as seen
+                imap.store(uid.encode('utf-8'), "+FLAGS", "\\Seen")
+                
+                # Extract body and attachments using _process_incoming logic
+                body_text = self._extract_plain_text(parsed)
+                att_name, att_raw = self._extract_attachment(parsed)
+                
+                from_addr = email.utils.parseaddr(parsed.get("From", ""))[1]
+                subject = parsed.get("Subject", "(sin asunto)")
+                date_hdr = parsed.get("Date", "")
+                
+                msg_dict = {
+                    "msg_type": "msg_body",
+                    "uid": uid,
+                    "from": from_addr,
+                    "subject": subject,
+                    "date": date_hdr,
+                    "body": body_text,
+                    "has_attachment": bool(att_raw),
+                }
+                if att_name and att_raw:
+                    msg_dict["att_name"] = att_name
+                    msg_dict["att_raw"] = base64.b64encode(att_raw).decode("utf-8")
+                    
+                payload = json.dumps(msg_dict).encode('utf-8')
+                self._send_to_client(client_hash, client_link, payload)
+        except Exception as exc:
+            log.error(f"Error IMAP (fetch_msg): {exc}")
+            from common import serialize_error
+            self._send_to_client(client_hash, client_link, serialize_error("imap_error", str(exc)))
+
+    def _handle_delete_msg(self, client_hash: bytes, client_link: Optional["RNS.Link"], imap_creds: dict, uid: str):
+        host = imap_creds.get("host")
+        port = imap_creds.get("port", 993)
+        username = imap_creds.get("user")
+        password = imap_creds.get("pass")
+        mailbox = "INBOX"
+
+        log.info(f"Borrando mensaje UID {uid} para {username}…")
+        try:
+            with imaplib.IMAP4_SSL(host, port) as imap:
+                imap.login(username, password)
+                imap.select(mailbox)
+                
+                # Mark as deleted
+                imap.store(uid.encode('utf-8'), "+FLAGS", "\\Deleted")
+                # Expunge to permanently delete
+                imap.expunge()
+                
+                from common import serialize_success
+                self._send_to_client(client_hash, client_link, serialize_success("Correo eliminado del servidor."))
+        except Exception as exc:
+            log.error(f"Error IMAP (delete_msg): {exc}")
             from common import serialize_error
             self._send_to_client(client_hash, client_link, serialize_error("imap_error", str(exc)))
 
