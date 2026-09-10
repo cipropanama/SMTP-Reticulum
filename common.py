@@ -87,6 +87,14 @@ def serialize_error(error_code: str, error_msg: str) -> bytes:
     return json.dumps(payload, ensure_ascii=False).encode("utf-8")
 
 
+def serialize_success(msg: str) -> bytes:
+    payload = {
+        "msg_type": "server_success",
+        "msg": msg,
+    }
+    return json.dumps(payload, ensure_ascii=False).encode("utf-8")
+
+
 def serialize_register_creds(smtp_creds: dict, imap_creds: dict) -> bytes:
     payload = {
         "msg_type": "register_creds",

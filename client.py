@@ -73,7 +73,9 @@ class RNSWorker(threading.Thread):
             self._emit("error", "Librería RNS no instalada. Instala con: pip install rns")
             return False
         try:
-            self._rns = RNS.Reticulum()
+            self._rns = RNS.Reticulum.get_instance()
+            if self._rns is None:
+                self._rns = RNS.Reticulum()
 
             if os.path.exists(IDENTITY_FILE):
                 self._identity = RNS.Identity.from_file(IDENTITY_FILE)
@@ -102,26 +104,47 @@ class RNSWorker(threading.Thread):
     def _on_packet_received(self, message: bytes, packet):
         try:
             msg = deserialize_message(message)
-            self._emit("inbox", msg)
+            msg_type = msg.get("msg_type")
+            if msg_type == "server_error":
+                self._emit("server_error", msg)
+            elif msg_type == "server_success":
+                self._emit("server_success", msg)
+            else:
+                self._emit("inbox", msg)
         except ValueError as exc:
             self._emit("error", f"Paquete entrante inválido: {exc}")
 
     def _on_link_established(self, link):
-        link.set_resource_callback(self._on_resource_received)
+        link.set_resource_strategy(RNS.Link.ACCEPT_ALL)
+        link.set_resource_concluded_callback(self._on_resource_received)
         link.set_resource_started_callback(
             lambda r: self._emit("status", f"Recibiendo recurso… ({format_size(r.get_data_size())})")
         )
 
     def _on_resource_received(self, resource):
-        if resource.status == RNS.Resource.COMPLETE:
-            data = resource.data.read() if hasattr(resource.data, "read") else bytes(resource.data)
-            try:
+        try:
+            if resource.status == RNS.Resource.COMPLETE:
+                data = None
+                if hasattr(resource, "data") and hasattr(resource.data, "read"):
+                    resource.data.seek(0)
+                    data = resource.data.read()
+                elif hasattr(resource, "data") and resource.data is not None:
+                    data = bytes(resource.data)
+                else:
+                    return
+
                 msg = deserialize_message(data)
-                self._emit("inbox", msg)
-            except ValueError as exc:
-                self._emit("error", f"Recurso entrante inválido: {exc}")
-        else:
-            self._emit("error", "Recurso entrante incompleto o cancelado.")
+                msg_type = msg.get("msg_type")
+                if msg_type == "server_error":
+                    self._emit("server_error", msg)
+                elif msg_type == "server_success":
+                    self._emit("server_success", msg)
+                else:
+                    self._emit("inbox", msg)
+            else:
+                self._emit("error", "Recurso entrante incompleto o cancelado.")
+        except Exception as exc:
+            self._emit("error", f"Recurso entrante inválido: {exc}")
 
     def send_message(self, payload: dict):
         self.cmd_queue.put(("send", payload))
@@ -135,31 +158,55 @@ class RNSWorker(threading.Thread):
     def set_gateway_hash(self, hex_str: str):
         self.cmd_queue.put(("set_gateway", hex_str))
 
+    def _get_gateway_identity(self):
+        gw_identity = RNS.Identity.recall(self._gateway_hash, from_identity_hash=True)
+        if gw_identity is None:
+            self._emit("status", "Buscando gateway en la red…")
+            for _ in range(15):
+                if not self._stop_event.is_set():
+                    time.sleep(1)
+                gw_identity = RNS.Identity.recall(self._gateway_hash, from_identity_hash=True)
+                if gw_identity:
+                    break
+        return gw_identity
+
+    def _send_via_link(self, gw_dest, data: bytes):
+        if hasattr(self, "_active_link") and self._active_link and self._active_link.status == RNS.Link.ACTIVE:
+            link = self._active_link
+        else:
+            link = RNS.Link(gw_dest)
+            timeout = time.time() + 20
+            while link.status != RNS.Link.ACTIVE and time.time() < timeout:
+                time.sleep(0.2)
+            if link.status != RNS.Link.ACTIVE:
+                self._emit("error", "No se pudo establecer link con el gateway.")
+                return
+
+        self._active_link = link
+        link.set_resource_strategy(RNS.Link.ACCEPT_ALL)
+        link.set_resource_concluded_callback(self._on_resource_received)
+        
+        resource = RNS.Resource(data, link, callback=self._send_callback)
+        self._emit("status", f"Transfiriendo recurso {format_size(len(data))}…")
+        timeout = time.time() + 120
+        while resource.status < RNS.Resource.COMPLETE and time.time() < timeout:
+            time.sleep(0.5)
+        if resource.status == RNS.Resource.COMPLETE:
+            self._emit("status", "Recurso entregado. Esperando confirmación del servidor…")
+        else:
+            self._emit("error", "Transferencia incompleta. Reintenta.")
+
     def _do_send(self, payload: dict):
         if self._gateway_hash is None:
             self._emit("error", "Hash del gateway no configurado. Ve a Ajustes.")
             return
 
         try:
-            gw_identity = RNS.Identity.recall(self._gateway_hash)
-            if gw_identity is None:
-                self._emit("status", "Buscando gateway en la red…")
-                for _ in range(15):
-                    if not self._stop_event.is_set():
-                        time.sleep(1)
-                    gw_identity = RNS.Identity.recall(self._gateway_hash)
-                    if gw_identity:
-                        break
-                if gw_identity is None:
-                    self._emit("error", "Gateway no alcanzable. Verifica la red Reticulum.")
-                    return
+            gw_identity = self._get_gateway_identity()
+            if not gw_identity: return
 
             gw_dest = RNS.Destination(
-                gw_identity,
-                RNS.Destination.OUT,
-                RNS.Destination.SINGLE,
-                APP_NAME,
-                ASPECT,
+                gw_identity, RNS.Destination.OUT, RNS.Destination.SINGLE, APP_NAME, ASPECT
             )
 
             data = serialize_message(
@@ -172,29 +219,7 @@ class RNSWorker(threading.Thread):
             )
 
             self._emit("status", f"Enviando {format_size(len(data))}…")
-
-            if len(data) <= MAX_PACKET_SIZE:
-                pkt = RNS.Packet(gw_dest, data)
-                pkt.send()
-                self._emit("sent", f"Enviado como Packet ({format_size(len(data))}).")
-            else:
-                link = RNS.Link(gw_dest)
-                timeout = time.time() + 20
-                while link.status != RNS.Link.ACTIVE and time.time() < timeout:
-                    time.sleep(0.2)
-                if link.status != RNS.Link.ACTIVE:
-                    self._emit("error", "No se pudo establecer link con el gateway.")
-                    return
-
-                resource = RNS.Resource(io.BytesIO(data), link, callback=self._send_callback)
-                self._emit("status", f"Transfiriendo recurso {format_size(len(data))}…")
-                timeout = time.time() + 120
-                while resource.status == RNS.Resource.TRANSFERRING and time.time() < timeout:
-                    time.sleep(0.5)
-                if resource.status == RNS.Resource.COMPLETE:
-                    self._emit("sent", f"Enviado como Resource ({format_size(len(data))}).")
-                else:
-                    self._emit("error", "Transferencia incompleta. Reintenta.")
+            self._send_via_link(gw_dest, data)
 
         except Exception as exc:
             self._emit("error", f"Error de envío: {exc}")
@@ -237,9 +262,8 @@ class RNSWorker(threading.Thread):
 
         from common import serialize_check_mail
         try:
-            gw_identity = RNS.Identity.recall(self._gateway_hash)
+            gw_identity = self._get_gateway_identity()
             if not gw_identity:
-                self._emit("error", "Gateway no alcanzable.")
                 return
 
             gw_dest = RNS.Destination(
@@ -248,8 +272,7 @@ class RNSWorker(threading.Thread):
 
             data = serialize_check_mail()
             self._emit("status", "Consultando servidor IMAP…")
-            pkt = RNS.Packet(gw_dest, data)
-            pkt.send()
+            self._send_via_link(gw_dest, data)
         except Exception as exc:
             self._emit("error", f"Error al consultar correo: {exc}")
 
@@ -259,7 +282,7 @@ class RNSWorker(threading.Thread):
             
         from common import serialize_register_creds
         try:
-            gw_identity = RNS.Identity.recall(self._gateway_hash)
+            gw_identity = self._get_gateway_identity()
             if not gw_identity:
                 return
 
@@ -267,9 +290,7 @@ class RNSWorker(threading.Thread):
                 gw_identity, RNS.Destination.OUT, RNS.Destination.SINGLE, APP_NAME, ASPECT
             )
             data = serialize_register_creds(smtp_creds, imap_creds)
-            pkt = RNS.Packet(gw_dest, data)
-            pkt.send()
-            self._emit("status", "Credenciales sincronizadas con el servidor.")
+            self._send_via_link(gw_dest, data)
         except Exception as exc:
             self._emit("error", f"Error al enviar credenciales: {exc}")
 
@@ -865,13 +886,27 @@ class CiproMailApp(tk.Tk):
             while True:
                 event_type, data = self.event_queue.get_nowait()
                 if event_type == "status":
+                    if data.startswith("Identidad cargada") or data.startswith("Nueva identidad creada"):
+                        hex_id = data.split(": ")[1][:16]
+                        if hasattr(self, "_id_lbl"):
+                            self._id_lbl.config(text=f"Identidad RNS: {hex_id}…")
                     self._status(str(data))
                 elif event_type == "error":
                     self._status(f"⚠ {data}", error=True)
                     messagebox.showerror("Error RNS", str(data))
                 elif event_type == "sent":
                     self._status(f"✓ {data}")
-                    messagebox.showinfo("Enviado", str(data))
+                elif event_type == "server_success":
+                    msg = data.get("msg", "Operación exitosa.")
+                    self._status(f"✓ {msg}")
+                    messagebox.showinfo("Éxito", msg)
+                    if "Correo entregado" in msg:
+                        self._to_var.set("")
+                        self._subject_var.set("")
+                        self._body_text.delete("1.0", tk.END)
+                        self._att_name = None
+                        self._att_bytes = None
+                        self._update_weight()
                 elif event_type == "inbox":
                     if data.get("msg_type") == "server_error":
                         # Ignoramos este paquete aquí porque ya se maneja en la sección específica de errores más abajo.
@@ -908,5 +943,10 @@ class CiproMailApp(tk.Tk):
 
 
 if __name__ == "__main__":
+    if RNS_AVAILABLE:
+        try:
+            RNS.Reticulum()
+        except Exception as e:
+            print(f"Failed to initialize RNS in main thread: {e}")
     app = CiproMailApp()
     app.mainloop()

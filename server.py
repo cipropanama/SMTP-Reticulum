@@ -72,7 +72,7 @@ class RNSListener(threading.Thread):
         log.info(f"Gateway escuchando en: {RNS.prettyhexrep(self.dest.hash)}")
 
         while True:
-            time.sleep(30)
+            time.sleep(5)
             self.dest.announce()
 
     def _on_packet(self, message: bytes, packet):
@@ -82,9 +82,10 @@ class RNSListener(threading.Thread):
     def _on_link_established(self, link: "RNS.Link"):
         log.info(f"Link entrante establecido: {RNS.prettyhexrep(link.hash)}")
 
-        link.set_resource_callback(self._make_resource_cb(link))
+        link.set_resource_strategy(RNS.Link.ACCEPT_ALL)
+        link.set_resource_concluded_callback(self._make_resource_cb(link))
         link.set_resource_started_callback(self._on_resource_started)
-        link.set_disconnected_callback(self._on_link_disconnected)
+        link.set_link_closed_callback(self._on_link_disconnected)
 
         if hasattr(link, "destination") and link.destination and hasattr(link.destination, "identity"):
             remote_identity = link.destination.identity
@@ -94,16 +95,27 @@ class RNSListener(threading.Thread):
 
     def _make_resource_cb(self, link):
         def _on_resource(resource):
-            if resource.status == RNS.Resource.COMPLETE:
-                data = resource.data.read() if hasattr(resource.data, "read") else bytes(resource.data)
-                log.info(f"Resource completo: {len(data)} bytes")
-                client_hash = None
-                if hasattr(link, "destination") and link.destination:
-                    if hasattr(link.destination, "identity") and link.destination.identity:
-                        client_hash = link.destination.identity.hash
-                self._process_outgoing(data, client_hash)
-            else:
-                log.warning("Resource incompleto o cancelado — descartando.")
+            try:
+                if resource.status == RNS.Resource.COMPLETE:
+                    data = None
+                    if hasattr(resource, "data") and hasattr(resource.data, "read"):
+                        resource.data.seek(0)
+                        data = resource.data.read()
+                    elif hasattr(resource, "data") and resource.data is not None:
+                        data = bytes(resource.data)
+                    else:
+                        raise ValueError("No data found in resource")
+                        
+                    log.info(f"Resource completo: {len(data)} bytes")
+                    client_hash = None
+                    if hasattr(link, "destination") and link.destination:
+                        if hasattr(link.destination, "identity") and link.destination.identity:
+                            client_hash = link.destination.identity.hash
+                    self._process_outgoing(data, client_hash, link)
+                else:
+                    log.warning("Resource incompleto o cancelado — descartando.")
+            except Exception as e:
+                log.error(f"Error procesando resource: {e}", exc_info=True)
         return _on_resource
 
     def _on_resource_started(self, resource):
@@ -112,25 +124,26 @@ class RNSListener(threading.Thread):
     def _on_link_disconnected(self, link):
         log.info(f"Link desconectado: {RNS.prettyhexrep(link.hash)}")
         with _sessions_lock:
-            to_remove = [
-                email_addr for email_addr, sess in _active_sessions.items()
-                if sess.get("link") is link
-            ]
-            for addr in to_remove:
-                del _active_sessions[addr]
-                log.info(f"Sesión eliminada para: {addr}")
+            for email_addr, sess in _active_sessions.items():
+                if sess.get("link") is link:
+                    sess["link"] = None
+                    log.info(f"Link de sesión liberado para: {email_addr}")
 
     def _register_link_session(self, client_hash: bytes, link):
         with _sessions_lock:
             hex_key = RNS.prettyhexrep(client_hash)
-            _active_sessions[hex_key] = {
-                "hash": client_hash,
-                "link": link,
-                "email": None,
-            }
-            log.info(f"Sesión provisional registrada para hash: {hex_key}")
+            if hex_key in _active_sessions:
+                _active_sessions[hex_key]["link"] = link
+                log.info(f"Link actualizado para sesión existente: {hex_key}")
+            else:
+                _active_sessions[hex_key] = {
+                    "hash": client_hash,
+                    "link": link,
+                    "email": None,
+                }
+                log.info(f"Sesión provisional registrada para hash: {hex_key}")
 
-    def _process_outgoing(self, data: bytes, client_hash: Optional[bytes]):
+    def _process_outgoing(self, data: bytes, client_hash: Optional[bytes], client_link: Optional["RNS.Link"] = None):
         try:
             msg = deserialize_message(data)
         except ValueError as exc:
@@ -139,28 +152,31 @@ class RNSListener(threading.Thread):
 
         msg_type = msg.get("msg_type", "send")
         hex_key = RNS.prettyhexrep(client_hash) if client_hash else None
+        
+        from common import serialize_success, serialize_error
 
         if msg_type == "register_creds":
             if hex_key:
                 with _sessions_lock:
                     if hex_key not in _active_sessions:
-                        _active_sessions[hex_key] = {"hash": client_hash, "link": None, "email": None}
+                        _active_sessions[hex_key] = {"hash": client_hash, "link": client_link, "email": None}
                     _active_sessions[hex_key]["smtp_creds"] = msg.get("smtp_creds", {})
                     _active_sessions[hex_key]["imap_creds"] = msg.get("imap_creds", {})
                 log.info(f"Credenciales registradas en memoria para {hex_key}")
+                if client_hash:
+                    self._send_to_client(client_hash, client_link, serialize_success("Credenciales registradas exitosamente."))
             return
 
         session = None
-        link = None
+        link = client_link
         if hex_key:
             with _sessions_lock:
                 session = _active_sessions.get(hex_key)
-                if session:
+                if session and link is None:
                     link = session.get("link")
 
         if not session or "smtp_creds" not in session or "imap_creds" not in session:
             log.warning(f"Operación {msg_type} rechazada: auth_required para {hex_key}")
-            from common import serialize_error
             if client_hash:
                 self._send_to_client(client_hash, link, serialize_error("auth_required", "Credenciales no encontradas en el servidor."))
             return
@@ -179,19 +195,13 @@ class RNSListener(threading.Thread):
 
         log.info(f"Despachando a Internet: {from_email} → {to_email} | Asunto: {subject}")
 
-        if from_email and client_hash:
+        if from_email:
             with _sessions_lock:
-                hex_key = RNS.prettyhexrep(client_hash)
-                if hex_key in _active_sessions:
-                    _active_sessions[hex_key]["email"] = from_email
-                    _active_sessions[from_email] = _active_sessions.pop(hex_key)
-                else:
-                    _active_sessions[from_email] = {
-                        "hash": client_hash,
-                        "link": None,
-                        "email": from_email,
-                    }
-                log.info(f"Sesión vinculada: {from_email} → {RNS.prettyhexrep(client_hash)}")
+                if session["email"] != from_email:
+                    session["email"] = from_email
+                    if hex_key != from_email:
+                        _active_sessions[from_email] = session
+                        log.info(f"Sesión vinculada: {from_email} → {hex_key}")
 
         try:
             dispatch_smtp(
@@ -203,9 +213,11 @@ class RNSListener(threading.Thread):
                 att_name   = att_name if att_name else None,
                 att_raw    = att_raw  if att_raw  else None,
             )
+            log.info("Despacho SMTP exitoso.")
+            if client_hash:
+                self._send_to_client(client_hash, link, serialize_success("Correo entregado al servidor SMTP."))
         except Exception as exc:
             log.error(f"Error despachando SMTP: {exc}")
-            from common import serialize_error
             if client_hash:
                 self._send_to_client(client_hash, link, serialize_error("smtp_error", str(exc)))
 
@@ -341,44 +353,47 @@ class RNSListener(threading.Thread):
         log.info(f"Transmitiendo {format_size(len(payload))} al cliente…")
 
         try:
-            client_identity = RNS.Identity.recall(client_hash)
-            if client_identity is None:
-                log.error("Identidad del cliente no disponible.")
-                return
+            link = existing_link
+            
+            # If we don't have an active link, try to create one or send a packet
+            if link is None or link.status != RNS.Link.ACTIVE:
+                client_identity = RNS.Identity.recall(client_hash)
+                if client_identity is None:
+                    log.error("Identidad del cliente no disponible y link no activo.")
+                    return
 
-            client_dest = RNS.Destination(
-                client_identity,
-                RNS.Destination.OUT,
-                RNS.Destination.SINGLE,
-                APP_NAME,
-                "inbox",
-            )
+                client_dest = RNS.Destination(
+                    client_identity,
+                    RNS.Destination.OUT,
+                    RNS.Destination.SINGLE,
+                    APP_NAME,
+                    "inbox",
+                )
 
-            if len(payload) <= MAX_PACKET_SIZE:
-                pkt = RNS.Packet(client_dest, payload)
-                pkt.send()
-                log.info(f"Packet enviado al cliente ({format_size(len(payload))}).")
-            else:
-                link = existing_link
-                if link is None or link.status != RNS.Link.ACTIVE:
+                if len(payload) <= MAX_PACKET_SIZE:
+                    pkt = RNS.Packet(client_dest, payload)
+                    pkt.send()
+                    log.info(f"Packet enviado al cliente ({format_size(len(payload))}).")
+                    return
+                else:
                     link = RNS.Link(client_dest)
                     timeout = time.time() + 20
                     while link.status != RNS.Link.ACTIVE and time.time() < timeout:
                         time.sleep(0.2)
 
-                if link.status != RNS.Link.ACTIVE:
-                    log.error("No se pudo establecer link con el cliente.")
-                    return
+            if link is None or link.status != RNS.Link.ACTIVE:
+                log.error("No se pudo establecer link con el cliente.")
+                return
 
-                resource = RNS.Resource(io.BytesIO(payload), link)
-                timeout = time.time() + 120
-                while resource.status == RNS.Resource.TRANSFERRING and time.time() < timeout:
-                    time.sleep(0.5)
+            resource = RNS.Resource(payload, link)
+            timeout = time.time() + 120
+            while resource.status < RNS.Resource.COMPLETE and time.time() < timeout:
+                time.sleep(0.5)
 
-                if resource.status == RNS.Resource.COMPLETE:
-                    log.info(f"Resource entregado al cliente ({format_size(len(payload))}).")
-                else:
-                    log.error("Transferencia de Resource al cliente incompleta.")
+            if resource.status == RNS.Resource.COMPLETE:
+                log.info(f"Resource entregado al cliente ({format_size(len(payload))}).")
+            else:
+                log.error("Transferencia de Resource al cliente incompleta.")
 
         except Exception as exc:
             log.error(f"Error enviando al cliente: {exc}")
