@@ -2,7 +2,6 @@ import sys
 import traceback
 import logging
 import os
-
 DATA_DIR = os.path.expanduser("~/.cipro_mail")
 if not os.path.exists(DATA_DIR):
     os.makedirs(DATA_DIR)
@@ -24,13 +23,47 @@ sys.excepthook = handle_exception
 
 try:
     import RNS
+    import RNS.Reticulum
+    import RNS.Interfaces.Interface
+    import RNS.Interfaces.LocalInterface
+    import RNS.Interfaces.AutoInterface
+    import RNS.Interfaces.TCPInterface
+    import RNS.Interfaces.UDPInterface
+    import RNS.Interfaces.I2PInterface
+    import RNS.Interfaces.RNodeInterface
+    import RNS.Interfaces.RNodeMultiInterface
+    import RNS.Interfaces.SerialInterface
+    import RNS.Interfaces.KISSInterface
+    import RNS.Interfaces.AX25KISSInterface
+    import RNS.Interfaces.PipeInterface
+    import RNS.Interfaces.BackboneInterface
+    import RNS.Interfaces.WeaveInterface
+
+    import sys
+    reticulum_mod = sys.modules["RNS.Reticulum"]
+    reticulum_mod.Interface = RNS.Interfaces.Interface
+    reticulum_mod.LocalInterface = RNS.Interfaces.LocalInterface
+    reticulum_mod.AutoInterface = RNS.Interfaces.AutoInterface
+    reticulum_mod.TCPInterface = RNS.Interfaces.TCPInterface
+    reticulum_mod.UDPInterface = RNS.Interfaces.UDPInterface
+    reticulum_mod.I2PInterface = RNS.Interfaces.I2PInterface
+    reticulum_mod.RNodeInterface = RNS.Interfaces.RNodeInterface
+    reticulum_mod.RNodeMultiInterface = RNS.Interfaces.RNodeMultiInterface
+    reticulum_mod.SerialInterface = RNS.Interfaces.SerialInterface
+    reticulum_mod.KISSInterface = RNS.Interfaces.KISSInterface
+    reticulum_mod.AX25KISSInterface = RNS.Interfaces.AX25KISSInterface
+    reticulum_mod.PipeInterface = RNS.Interfaces.PipeInterface
+    reticulum_mod.BackboneInterface = RNS.Interfaces.BackboneInterface
+    reticulum_mod.WeaveInterface = RNS.Interfaces.WeaveInterface
+
     RNS_AVAILABLE = True
     log.info("Initializing RNS before Tkinter to avoid Segfault...")
     RNS.Reticulum()
 except ImportError:
     RNS_AVAILABLE = False
 except Exception as e:
-    log.error(f"Failed to initialize RNS: {e}")
+    import traceback
+    log.error(f"Failed to initialize RNS: {e}\n{traceback.format_exc()}")
     RNS_AVAILABLE = False
 
 import io
@@ -133,20 +166,34 @@ class RNSWorker(threading.Thread):
 
     def _save_outbox(self, outbox_list):
         try:
+            import base64
+            serializable_list = []
+            for p in outbox_list:
+                p_copy = p.copy()
+                if p_copy.get("att_bytes") is not None:
+                    p_copy["att_bytes"] = base64.b64encode(p_copy["att_bytes"]).decode('ascii')
+                serializable_list.append(p_copy)
+            
             cipher = get_cipher()
-            enc = cipher.encrypt(json.dumps(outbox_list).encode('utf-8'))
+            enc = cipher.encrypt(json.dumps(serializable_list).encode('utf-8'))
             with open(OUTBOX_FILE, 'wb') as f:
                 f.write(enc)
+            self._emit("outbox_updated", None)
         except Exception as e:
             self._emit("error", f"Error guardando outbox: {e}")
 
     def _load_outbox(self):
         if not os.path.exists(OUTBOX_FILE): return []
         try:
+            import base64
             cipher = get_cipher()
             with open(OUTBOX_FILE, 'rb') as f:
                 enc = f.read()
-            return json.loads(cipher.decrypt(enc).decode('utf-8'))
+            loaded = json.loads(cipher.decrypt(enc).decode('utf-8'))
+            for p in loaded:
+                if p.get("att_bytes") is not None:
+                    p["att_bytes"] = base64.b64decode(p["att_bytes"])
+            return loaded
         except:
             return []
 
@@ -156,17 +203,24 @@ class RNSWorker(threading.Thread):
         self._save_outbox(ob)
         self._emit("status", "Mensaje guardado en Outbox (Offline)")
 
-    def _flush_outbox(self):
+    def _flush_outbox(self, wait_for_gateway=False):
         ob = self._load_outbox()
         if not ob: return
         self._emit("status", f"Intentando enviar {len(ob)} mensajes del Outbox...")
         remaining = []
         for p in ob:
-            success = self._do_send_internal(p)
+            success = self._do_send_internal(p, wait_for_gateway=wait_for_gateway, link_timeout=10)
             if not success:
                 remaining.append(p)
+            else:
+                self._emit("status", "✓ Mensaje enviado exitosamente.")
+                self._emit("msg_sent", p)
         if len(remaining) < len(ob):
             self._save_outbox(remaining)
+
+    def _do_send(self, payload: dict):
+        self._add_to_outbox(payload)
+        self._flush_outbox(wait_for_gateway=True)
 
     def _init_rns(self) -> bool:
         if not RNS_AVAILABLE:
@@ -271,9 +325,9 @@ class RNSWorker(threading.Thread):
     def set_gateway_hash(self, hex_str: str):
         self.cmd_queue.put(("set_gateway", hex_str))
 
-    def _get_gateway_identity(self):
+    def _get_gateway_identity(self, wait=True):
         gw_identity = RNS.Identity.recall(self._gateway_hash, from_identity_hash=True)
-        if gw_identity is None:
+        if gw_identity is None and wait:
             self._emit("status", "Buscando gateway en la red…")
             for _ in range(15):
                 if not self._stop_event.is_set():
@@ -283,16 +337,17 @@ class RNSWorker(threading.Thread):
                     break
         return gw_identity
 
-    def _send_via_link(self, gw_dest, data: bytes):
+    def _send_via_link(self, gw_dest, data: bytes, link_timeout=20):
         if hasattr(self, "_active_link") and self._active_link and self._active_link.status == RNS.Link.ACTIVE:
             link = self._active_link
         else:
             link = RNS.Link(gw_dest)
-            timeout = time.time() + 20
+            timeout = time.time() + link_timeout
             while link.status != RNS.Link.ACTIVE and time.time() < timeout:
                 time.sleep(0.2)
             if link.status != RNS.Link.ACTIVE:
-                self._emit("error", "No se pudo establecer link con el gateway.")
+                if link_timeout >= 20:
+                    self._emit("error", "No se pudo establecer link con el gateway.")
                 return False
 
         self._active_link = link
@@ -311,13 +366,13 @@ class RNSWorker(threading.Thread):
             self._emit("error", "Transferencia incompleta. Reintenta.")
             return False
 
-    def _do_send_internal(self, payload: dict):
+    def _do_send_internal(self, payload: dict, wait_for_gateway=True, link_timeout=20):
         if self._gateway_hash is None:
             self._emit("error", "Hash del gateway no configurado. Ve a Ajustes.")
             return False
 
         try:
-            gw_identity = self._get_gateway_identity()
+            gw_identity = self._get_gateway_identity(wait=wait_for_gateway)
             if not gw_identity: return False
 
             gw_dest = RNS.Destination(
@@ -334,16 +389,14 @@ class RNSWorker(threading.Thread):
             )
 
             self._emit("status", f"Enviando {format_size(len(data))}…")
-            return self._send_via_link(gw_dest, data)
+            return self._send_via_link(gw_dest, data, link_timeout=link_timeout)
 
         except Exception as exc:
             self._emit("error", f"Error de envío: {exc}")
             return False
 
     
-    def _do_send(self, payload: dict):
-        if not self._do_send_internal(payload):
-            self._add_to_outbox(payload)
+
 
     def _send_callback(self, resource):
         self._emit("status", "✓ Recurso entregado al gateway.")
@@ -384,8 +437,16 @@ class RNSWorker(threading.Thread):
                         if not exists:
                             h["folder"] = "Entrada"
                             self._inbox.append(h)
+                elif cmd == "delete_outbox":
+                    self._do_delete_outbox(data)
             except queue.Empty:
                 self._flush_outbox()
+
+    def _do_delete_outbox(self, idx: int):
+        ob = self._load_outbox()
+        if 0 <= idx < len(ob):
+            ob.pop(idx)
+            self._save_outbox(ob)
 
     def stop(self):
         self._stop_event.set()
@@ -500,6 +561,7 @@ class CiproMailApp(ctk.CTk):
         self._att_bytes = None
         self._att_name  = None
         self._inbox     = self._load_inbox_from_disk()
+        self._outbox_cache = []
         for msg in self._inbox:
             if "folder" not in msg:
                 msg["folder"] = "Entrada"
@@ -567,6 +629,8 @@ class CiproMailApp(ctk.CTk):
         self._build_settings_tab()
 
     def _open_compose_window(self, prefill_to="", prefill_subj="", prefill_body=""):
+        self._att_bytes = None
+        self._att_name  = None
         self._compose_win = ctk.CTkToplevel(self)
         self._compose_win.title("Redactar Correo")
         self._compose_win.geometry("600x500")
@@ -637,6 +701,8 @@ class CiproMailApp(ctk.CTk):
         self._folder_tree = ttk.Treeview(left_panel, show="tree", style="Treeview")
         self._folder_tree.pack(fill="both", expand=True, padx=5, pady=5)
         self._folder_tree.insert("", "end", "Entrada", text="📥 Entrada")
+        self._folder_tree.insert("", "end", "Salida", text="📤 Salida")
+        self._folder_tree.insert("", "end", "Enviados", text="🚀 Enviados")
         self._folder_tree.insert("", "end", "Archivados", text="📦 Archivados")
         self._folder_tree.insert("", "end", "Spam", text="🚫 Spam")
         self._folder_tree.insert("", "end", "Eliminados", text="🗑️ Eliminados")
@@ -705,21 +771,34 @@ class CiproMailApp(ctk.CTk):
     def _refresh_msg_list(self):
         for child in self._tree.get_children():
             self._tree.delete(child)
-        for i, msg in enumerate(self._inbox):
-            folder = msg.get("folder", "Entrada")
-            show = False
             
-            if self._current_folder == "Entrada":
-                # En la bandeja de entrada mostramos todo excepto eliminados y spam
-                if folder not in ("Eliminados", "Spam"):
-                    show = True
-            elif self._current_folder == folder:
-                show = True
-                
-            if show:
+        if self._current_folder == "Salida":
+            if hasattr(self, 'rns_worker') and self.rns_worker:
+                self._outbox_cache = self.rns_worker._load_outbox()
+            else:
+                self._outbox_cache = []
+            
+            for i, msg in enumerate(self._outbox_cache):
                 timestamp = self._format_date(msg.get("date", ""))
-                status = "📦 Archivado" if folder == "Archivados" else ""
-                self._tree.insert("", "end", iid=str(i), values=(timestamp, msg.get("from", "-"), msg.get("subject", "(sin asunto)"), status))
+                to_addr = msg.get("to", "-")
+                subj = msg.get("subject", "(sin asunto)")
+                self._tree.insert("", "end", iid=f"outbox_{i}", values=(timestamp, f"Para: {to_addr}", subj, "Pendiente"))
+        else:
+            for i, msg in enumerate(self._inbox):
+                folder = msg.get("folder", "Entrada")
+                show = False
+                
+                if self._current_folder == "Entrada":
+                    if folder not in ("Eliminados", "Spam", "Archivados", "Enviados"):
+                        show = True
+                elif self._current_folder == folder:
+                    show = True
+                    
+                if show:
+                    timestamp = self._format_date(msg.get("date", ""))
+                    status = "📦 Archivado" if folder == "Archivados" else ""
+                    self._tree.insert("", "end", iid=str(i), values=(timestamp, msg.get("from", "-"), msg.get("subject", "(sin asunto)"), status))
+                    
         self._read_text.configure(state="normal")
         self._read_text.delete("1.0", "end")
         self._read_text.configure(state="disabled")
@@ -895,6 +974,7 @@ class CiproMailApp(ctk.CTk):
         self.rns_worker.set_gateway_hash(gw_hash)
 
         payload = {
+            "date":      time.strftime("%a, %d %b %Y %H:%M:%S %z"),
             "to":        to,
             "from_addr": self._from_var.get().strip(),
             "subject":   subject,
@@ -904,6 +984,12 @@ class CiproMailApp(ctk.CTk):
         }
         self.rns_worker.send_message(payload)
         self._status("📡 Enviando mensaje...")
+        if hasattr(self, "_compose_win") and self._compose_win and self._compose_win.winfo_exists():
+            try:
+                self._compose_win.grab_release()
+            except Exception:
+                pass
+            self._compose_win.destroy()
 
     def _sync_mail(self):
         gw_hash = self._gw_hash_var.get().strip()
@@ -1015,10 +1101,19 @@ class CiproMailApp(ctk.CTk):
         selected = self._tree.selection()
         if not selected:
             return
-        idx = int(selected[0])
-        msg = self._inbox[idx]
+        iid = selected[0]
+        
+        is_outbox = str(iid).startswith("outbox_")
+        
+        if is_outbox:
+            idx = int(str(iid).split("_")[1])
+            if idx >= len(self._outbox_cache): return
+            msg = self._outbox_cache[idx]
+        else:
+            idx = int(iid)
+            msg = self._inbox[idx]
 
-        if "body" not in msg:
+        if not is_outbox and "body" not in msg:
             self._read_text.configure(state="normal")
             self._read_text.delete("1.0", "end")
             self._read_text.insert("end", f"De:     {msg.get('from', '-')}\n")
@@ -1036,21 +1131,34 @@ class CiproMailApp(ctk.CTk):
 
         self._read_text.configure(state="normal")
         self._read_text.delete("1.0", "end")
-        self._read_text.insert("end", f"De:     {msg.get('from', '-')}\n")
+        
+        from_display = msg.get("from_addr", "-") if is_outbox else msg.get("from", "-")
+        self._read_text.insert("end", f"De:     {from_display}\n")
         self._read_text.insert("end", f"Para:   {msg.get('to', '-')}\n")
         self._read_text.insert("end", f"Asunto: {msg.get('subject', '-')}\n")
+        self._read_text.insert("end", f"Fecha:  {self._format_date(msg.get('date', ''))}\n")
         self._read_text.insert("end", "─" * 50 + "\n")
         self._read_text.insert("end", msg.get("body", ""))
         self._read_text.configure(state="disabled")
 
-        if msg.get("has_attachment") and msg.get("att_raw"):
-            self._save_att_btn.configure(state="normal")
-        else:
-            self._save_att_btn.configure(state="disabled")
+        if is_outbox:
+            self._reply_btn.configure(state="disabled")
+            self._archive_btn.configure(state="disabled")
+            self._delete_btn.configure(state="normal")
             
-        self._reply_btn.configure(state="normal")
-        self._delete_btn.configure(state="normal")
-        self._archive_btn.configure(state="normal")
+            if msg.get("att_bytes"):
+                self._save_att_btn.configure(state="normal")
+            else:
+                self._save_att_btn.configure(state="disabled")
+        else:
+            if msg.get("has_attachment") and msg.get("att_raw"):
+                self._save_att_btn.configure(state="normal")
+            else:
+                self._save_att_btn.configure(state="disabled")
+                
+            self._reply_btn.configure(state="normal")
+            self._delete_btn.configure(state="normal")
+            self._archive_btn.configure(state="normal")
 
     def _reply_message(self):
         selected = self._tree.selection()
@@ -1073,7 +1181,15 @@ class CiproMailApp(ctk.CTk):
         selected = self._tree.selection()
         if not selected:
             return
-        idx = int(selected[0])
+        iid = selected[0]
+        
+        if str(iid).startswith("outbox_"):
+            idx = int(str(iid).split("_")[1])
+            if hasattr(self, 'rns_worker') and self.rns_worker:
+                self.rns_worker.cmd_queue.put(("delete_outbox", idx))
+            return
+            
+        idx = int(iid)
         msg = self._inbox[idx]
         uid = msg.get("uid")
         
@@ -1097,9 +1213,19 @@ class CiproMailApp(ctk.CTk):
         selected = self._tree.selection()
         if not selected:
             return
-        idx = int(selected[0])
-        msg = self._inbox[idx]
-        att_raw  = msg.get("att_raw", b"")
+        iid = selected[0]
+        
+        is_outbox = str(iid).startswith("outbox_")
+        if is_outbox:
+            idx = int(str(iid).split("_")[1])
+            if idx >= len(self._outbox_cache): return
+            msg = self._outbox_cache[idx]
+            att_raw = msg.get("att_bytes", b"")
+        else:
+            idx = int(iid)
+            msg = self._inbox[idx]
+            att_raw = msg.get("att_raw", b"")
+            
         att_name = msg.get("att_name", "adjunto")
 
         if not att_raw:
@@ -1233,10 +1359,11 @@ class CiproMailApp(ctk.CTk):
                     self._status(f"✓ {msg}")
                     messagebox.showinfo("Éxito", msg)
                     if "entregado" in msg.lower():
-                        self._to_var.set("")
-                        self._subject_var.set("")
-                        self._body_text.delete("1.0", "end")
-                        self._clear_attachment()
+                        if hasattr(self, "_compose_win") and self._compose_win and self._compose_win.winfo_exists():
+                            self._to_var.set("")
+                            self._subject_var.set("")
+                            self._body_text.delete("1.0", "end")
+                            self._clear_attachment()
                 elif event_type == "inbox":
                     if data.get("msg_type") == "server_error":
                         pass 
@@ -1252,6 +1379,18 @@ class CiproMailApp(ctk.CTk):
                     if h not in self._discovered_gateways:
                         self._discovered_gateways[h] = name
                         self._update_gateway_dropdown()
+                elif event_type == "msg_sent":
+                    import uuid
+                    sent_msg = data.copy()
+                    sent_msg["folder"] = "Enviados"
+                    if "date" not in sent_msg:
+                        sent_msg["date"] = email.utils.formatdate(localtime=True)
+                    if "uid" not in sent_msg:
+                        sent_msg["uid"] = str(uuid.uuid4())
+                    self._add_to_inbox(sent_msg)
+                elif event_type == "outbox_updated":
+                    if self._current_folder == "Salida":
+                        self._refresh_msg_list()
                 elif event_type == "server_error":
                     code = data.get("error_code")
                     msg = data.get("error_msg")
